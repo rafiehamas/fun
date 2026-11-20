@@ -1,6 +1,5 @@
 """Offline quantile forecasts for scheduled reads of a trophy tracker."""
 
-from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -140,6 +139,13 @@ def growth_path(snapshots, anchor, target, rng):
     last = snapshots[-1]
     age = last.time - anchor
     observed, trust, disagreement = evidence(snapshots, anchor, lambda snap: snap.players)
+    recent = [snap for snap in snapshots if last.time - snap.time <= 0.9]
+    recent_slope, recent_trust, _ = evidence(recent, anchor, lambda snap: snap.players)
+    if len(recent) >= 4:
+        # The full window can otherwise extrapolate launch acceleration long
+        # after recent refreshes show the tracked population leveling off.
+        recent_weight = 0.55 * recent_trust
+        observed += recent_weight * clamp(recent_slope - observed, -1.1, 1.1)
     observed = clamp(observed, 0, 2.7)
     exponent = 0.78 * (1 - 0.84 * trust) + observed * 0.84 * trust
     cadence = median(b.time - a.time for a, b in zip(snapshots, snapshots[1:])) if len(snapshots) > 1 else 0.25
@@ -149,7 +155,7 @@ def growth_path(snapshots, anchor, target, rng):
         staleness = cadence * rng.random() * (0.5 + rng.random())
         effective_age = max(age, target - anchor - staleness)
         dx = ratio_log(effective_age, age)
-        drift = rng.gauss(0, 0.18 + min(0.4, disagreement * 0.25) + 0.18 * (1 - trust))
+        drift = rng.gauss(0, 0.14 + min(0.4, disagreement * 0.25) + 0.22 * (1 - trust))
         grow = clamp(exponent + drift, 0.0, 2.9)
         multiplier = math.exp(grow * dx)
         yield dx, max(0, remaining - staleness), max(last.players, round(last.players * multiplier))
@@ -230,18 +236,34 @@ def adjudicate(case):
             else:
                 group_slope = group_centers[kind]
                 earned = midpoint(bounds)
-                size_trust = earned / (earned + 7)
+                size_trust = earned / (earned + 5)
                 own_weight = (0.25 + 0.68 * size_trust) * trust
                 if stable_count:
                     own_weight = max(own_weight, 0.65 * trust)
                     group_slope *= 1 - 0.45 * trust
                 center = clamp(own_weight * slope + (1 - own_weight) * group_slope, 0.0, 2.75)
-                sigma = 0.22 + 0.28 * (1 - trust) + min(0.58, error * 0.6)
+                sigma = 0.15 + 0.35 * (1 - trust) + min(0.58, error * 0.6)
                 values = project(paths, read, bounds, kind, center, sigma, trophy_rng)
         result.append({'id': trophy['id'], 'q': quantiles(values, levels)})
     if all(fit is not None for fit in per_trophy):
         constrain_prerequisites(case['trophies'], result)
     return {'trophies': result}
+
+
+def additional_earners(mean, rng):
+    # Small unlock counts are discrete and right-skewed. The gamma mixture
+    # allows extra variation in activity among otherwise similar cohorts.
+    overdispersion = 0.12
+    if mean < 12:
+        rate = rng.gammavariate(1 / overdispersion, overdispersion * mean) if mean > 0 else 0
+        time = rng.expovariate(1)
+        count = 0
+        while time <= rate:
+            count += 1
+            time += rng.expovariate(1)
+        return count
+    deviation = math.sqrt(mean + overdispersion * mean * mean)
+    return max(0, round(rng.gauss(mean, deviation)))
 
 
 def project(paths, read, bounds, kind, center, sigma, rng):
@@ -259,10 +281,7 @@ def project(paths, read, bounds, kind, center, sigma, rng):
             slope = clamp(rng.gauss(center, sigma), 0, 3.4)
             trend = (count + 0.35) * math.expm1(slope * dx)
             background = (0.07 if kind == 'completion' else 0.20) * elapsed
-            mean = trend + background
-            noise = math.sqrt(mean + 0.12 * mean * mean)
-            extra = max(0, round(rng.gauss(mean, noise)))
-            future = count + extra
+            future = count + additional_earners(trend + background, rng)
         values.append(round(clamp(100 * future / players, 0, 100), 2))
     return values
 
